@@ -6,7 +6,10 @@ from urllib.parse import unquote_plus
 
 textract = boto3.client("textract")
 
-# Danh sách kỹ năng thống nhất với tài liệu nhóm
+# ============================================
+# 1. DANH SACH KY NANG
+# ============================================
+
 SKILLS = [
     "java", "spring boot", "python",
     "javascript", "react", "angular",
@@ -33,16 +36,27 @@ SKILL_ALIASES = {
 
 SECTION_HEADINGS = [
     "professional summary",
-    "profile", "education",
-    "technical skills", "skills",
-    "work experience", "experience",
-    "projects", "soft skills",
-    "contact", "languages",
+    "profile",
+    "education",
+    "technical skills",
+    "skills",
+    "work experience",
+    "experience",
+    "projects",
+    "soft skills",
+    "contact",
+    "languages",
     "foreign language",
-    "summary", "học vấn",
-    "kinh nghiệm", "kỹ năng"
+    "summary",
+    "học vấn",
+    "kinh nghiệm",
+    "kỹ năng"
 ]
 
+
+# ============================================
+# 2. CAC HAM HO TRO
+# ============================================
 
 def normalize_spaces(value):
     return re.sub(r"\s+", " ", str(value)).strip()
@@ -50,12 +64,15 @@ def normalize_spaces(value):
 
 def is_heading(line):
     value = normalize_spaces(line).lower()
-
     return value in SECTION_HEADINGS
 
 
+# ============================================
+# 3. TRICH XUAT HO TEN
+# ============================================
+
 def extract_name(lines):
-    # Ưu tiên dòng có nhãn tên rõ ràng
+
     for line in lines[:12]:
         match = re.match(
             r"^(?:full name|name|họ và tên)"
@@ -63,14 +80,14 @@ def extract_name(lines):
             line,
             re.IGNORECASE
         )
+
         if match:
             return normalize_spaces(match.group(1))
 
-    # Trường hợp tên nằm ở đầu CV,
-    # có thể bị chia thành nhiều dòng
     parts = []
 
     for line in lines[:6]:
+
         value = normalize_spaces(line)
 
         if is_heading(value):
@@ -104,22 +121,35 @@ def extract_name(lines):
     return normalize_spaces(" ".join(parts))
 
 
+# ============================================
+# 4. TRICH XUAT EMAIL
+# ============================================
+
 def extract_email(text):
+
     match = re.search(
         r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
         text
     )
+
     return match.group(0) if match else ""
 
 
+# ============================================
+# 5. TRICH XUAT SO DIEN THOAI
+# ============================================
+
 def extract_phone(lines):
+
     pattern = (
         r"(?<!\d)(?:\+84|0)"
         r"(?:[\s.-]?\d){9}(?!\d)"
     )
 
     def find_phone(text):
+
         for match in re.finditer(pattern, text):
+
             digits = re.sub(
                 r"\D", "", match.group()
             )
@@ -137,37 +167,48 @@ def extract_phone(lines):
 
         return ""
 
-    # Ưu tiên dòng có nhãn số điện thoại
     for i, line in enumerate(lines):
+
         if re.search(
             r"phone|mobile|điện thoại",
             line,
             re.IGNORECASE
         ):
+
             for candidate in lines[i:i + 4]:
+
                 found = find_phone(candidate)
+
                 if found:
                     return found
 
-    # Nếu không có nhãn, tìm trên từng dòng
     for line in lines:
+
         found = find_phone(line)
+
         if found:
             return found
 
     return ""
 
 
+# ============================================
+# 6. TRICH XUAT KY NANG
+# ============================================
+
 def extract_skills(text):
+
     detected = []
     lower_text = text.lower()
 
     for skill in SKILLS:
+
         aliases = SKILL_ALIASES.get(
             skill, [skill]
         )
 
         for alias in aliases:
+
             pattern = (
                 r"(?<!\w)"
                 + re.escape(alias)
@@ -181,73 +222,91 @@ def extract_skills(text):
     return sorted(set(detected))
 
 
+# ============================================
+# 7. TRICH XUAT KINH NGHIEM
+# ============================================
+
 def extract_experience(lines):
+
     text = "\n".join(lines)
 
-    # Ưu tiên giá trị tổng kinh nghiệm
-    # được tác giả CV ghi trực tiếp
-    total_match = re.search(
-        r"(?:total experience|"
-        r"tổng kinh nghiệm)\s*:\s*"
-        r"(\d+(?:[.,]\d+)?)\s*"
-        r"(years?|yrs?|năm|months?|tháng)",
-        text,
-        re.IGNORECASE
+    number = r"\d+(?:[.,]\d+)?"
+    year_unit = r"(?:years?|yrs?|năm)"
+    month_unit = r"(?:months?|mos?|tháng)"
+
+    def to_years(match):
+
+        years = 0.0
+
+        if match.group("years"):
+            years = float(
+                match.group("years").replace(",", ".")
+            )
+
+        months = 0.0
+
+        if match.group("months"):
+            months = float(
+                match.group("months").replace(",", ".")
+            )
+
+        return round(years + months / 12, 2)
+
+    # Truong hop co tong kinh nghiem
+    total_pattern = (
+        r"(?:total experience|tổng kinh nghiệm|"
+        r"kinh nghiệm)\s*:\s*"
+        + rf"(?:(?P<years>{number})\s*{year_unit}\s*)?"
+        + rf"(?:(?P<months>{number})\s*{month_unit})?"
     )
 
-    if total_match:
-        number = float(
-            total_match.group(1).replace(",", ".")
-        )
-        unit = total_match.group(2).lower()
-
-        years = (
-            number / 12
-            if unit.startswith(
-                ("month", "tháng")
-            )
-            else number
-        )
-
-        return (
-            total_match.group(0),
-            round(years, 2)
-        )
-
-    # Ví dụ: "with 6 months of experience"
-    # hoặc "with 5 years of experience"
     match = re.search(
-        r"(\d+(?:[.,]\d+)?)\s*"
-        r"(years?|yrs?|năm|months?|tháng)"
-        r"\s+(?:of\s+)?"
-        r"(?:practical\s+)?experience",
+        total_pattern,
         text,
         re.IGNORECASE
     )
 
-    if match:
-        number = float(
-            match.group(1).replace(",", ".")
-        )
-        unit = match.group(2).lower()
-
-        years = (
-            number / 12
-            if unit.startswith(
-                ("month", "tháng")
-            )
-            else number
-        )
-
+    if match and (
+        match.group("years")
+        or match.group("months")
+    ):
         return (
-            match.group(0),
-            round(years, 2)
+            match.group(0).strip(),
+            to_years(match)
+        )
+
+    # Vi du: 2 years 6 months of experience
+    english_pattern = (
+        rf"(?:(?P<years>{number})\s*{year_unit}\s*)?"
+        + rf"(?:(?P<months>{number})\s*{month_unit})?"
+        + r"\s+(?:of\s+)?"
+        r"(?:practical\s+)?experience\b"
+    )
+
+    match = re.search(
+        english_pattern,
+        text,
+        re.IGNORECASE
+    )
+
+    if match and (
+        match.group("years")
+        or match.group("months")
+    ):
+        return (
+            match.group(0).strip(),
+            to_years(match)
         )
 
     return "", None
 
 
+# ============================================
+# 8. TONG HOP THONG TIN UNG VIEN
+# ============================================
+
 def extract_information(lines):
+
     lines = [
         normalize_spaces(line)
         for line in lines
@@ -306,13 +365,36 @@ def extract_information(lines):
         "experience": experience,
         "experienceYears": experience_years,
         "warnings": warnings,
-        "extractionStatus": status,
-        "raw_text": text
+        "extractionStatus": status
     }
 
 
+# ============================================
+# 9. XAC DINH JOB ID TU DUONG DAN S3
+# ============================================
+
+def extract_job_id(key):
+
+    parts = key.split("/")
+
+    if (
+        len(parts) >= 3
+        and parts[0] == "cvs"
+        and parts[1]
+    ):
+        return parts[1]
+
+    return None
+
+
+# ============================================
+# 10. XU LY CV BANG TEXTRACT
+# ============================================
+
 def process_cv(bucket, key):
+
     if not key.lower().endswith(".pdf"):
+
         return {
             "statusCode": 400,
             "error": "Only PDF is supported",
@@ -339,19 +421,30 @@ def process_cv(bucket, key):
     return {
         "statusCode": 200,
         "bucket": bucket,
+        "key": key,
         "file": key,
+        "jobId": extract_job_id(key),
         "candidate": candidate
     }
 
 
+# ============================================
+# 11. LAMBDA HANDLER
+# ============================================
+
 def lambda_handler(event, context):
+
     try:
-        # Hỗ trợ cả Test Event và S3 Trigger
+
+        # Xu ly su kien tu S3
         if "Records" in event:
+
             results = []
 
             for record in event["Records"]:
+
                 bucket = record["s3"]["bucket"]["name"]
+
                 key = unquote_plus(
                     record["s3"]["object"]["key"]
                 )
@@ -360,8 +453,9 @@ def lambda_handler(event, context):
                     process_cv(bucket, key)
                 )
 
-            # Không in thông tin cá nhân lên log
+            # Chi ghi trang thai, khong in noi dung CV
             for result in results:
+
                 print(json.dumps({
                     "file": result.get("file"),
                     "statusCode": result.get(
@@ -375,14 +469,17 @@ def lambda_handler(event, context):
 
             return {"results": results}
 
+        # Xu ly Test Event thu cong
         bucket = event["bucket"]
         key = event["key"]
 
         return process_cv(bucket, key)
 
     except Exception as error:
+
         print(
             "CV_PROCESS_ERROR:",
             type(error).__name__
         )
+
         raise
