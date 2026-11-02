@@ -5,6 +5,7 @@ import re
 from urllib.parse import unquote_plus
 
 textract = boto3.client("textract")
+score_lambda = boto3.client("lambda")
 
 # ============================================
 # 1. DANH SACH KY NANG
@@ -448,10 +449,46 @@ def lambda_handler(event, context):
                 key = unquote_plus(
                     record["s3"]["object"]["key"]
                 )
+                
+                result = process_cv(bucket, key)
 
-                results.append(
-                    process_cv(bucket, key)
-                )
+                if (
+                    result.get("statusCode") == 200
+                    and result.get("jobId")
+                ):
+                    payload = {
+                        "jobId": result["jobId"],
+                        "bucket": bucket,
+                        "key": key,
+                        "candidate": result["candidate"]
+                    }
+
+                    response = score_lambda.invoke(
+                        FunctionName="cv-score",
+                        InvocationType="Event",
+                        Payload=json.dumps(
+                            payload,
+                            ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+
+                    invoke_status = response.get(
+                        "StatusCode"
+                    )
+
+                    if invoke_status != 202:
+                        raise RuntimeError(
+                            "Cannot queue CV scoring"
+                        )
+
+                    print(json.dumps({
+                        "jobId": result["jobId"],
+                        "scoreInvokeStatus": invoke_status
+                    }))
+
+                results.append(result)
+
+
 
             # Chi ghi trang thai, khong in noi dung CV
             for result in results:
