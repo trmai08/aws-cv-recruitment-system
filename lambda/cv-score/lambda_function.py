@@ -4,10 +4,16 @@ import json
 from datetime import datetime, timezone
 from decimal import Decimal
 
+
 lambda_client = boto3.client("lambda")
-table = boto3.resource("dynamodb").Table("CVApplications")
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("CVApplications")
+jobs_table = dynamodb.Table("Jobs")
+
 SOURCE_LAMBDA = "cv-process"
-BUCKET = "cv-recruitment-ute-2026-2027"
+BUCKET = "cv-recruitment-24110285"
+
 
 
 def to_json(value):
@@ -59,30 +65,173 @@ def load_candidate(payload):
     return result["candidate"]
 
 
+
 def process(payload):
-    required = payload.get("requiredSkills", ["java", "spring boot", "sql", "git"])
-    if not isinstance(required, list):
-        raise ValueError("requiredSkills must be an array")
-    minimum = float(payload.get("minExperience", 2))
-    job_id = str(payload.get("jobId", "java-backend"))
+    job_id = str(payload.get("jobId", "")).strip()
+
+    if not job_id:
+        raise ValueError("jobId is required")
+
+    # Lay tieu chi tu bang Jobs
+    response = jobs_table.get_item(
+        Key={"jobId": job_id}
+    )
+    job = response.get("Item")
+
+    if not job:
+        raise ValueError("Job does not exist")
+
+    required = job.get("requiredSkills", [])
+
+    if (
+        not isinstance(required, list)
+        or not required
+        or not all(
+            isinstance(s, str) and s.strip()
+            for s in required
+        )
+    ):
+        raise ValueError(
+            "Job requiredSkills is invalid"
+        )
+
+    minimum = float(job.get("minExperience", 0))
+
+    if minimum <= 0:
+        raise ValueError(
+            "Job minExperience must be positive"
+        )
+
+    # Xu ly thong tin ung vien
     candidate = load_candidate(payload)
     scores = score_cv(candidate, required, minimum)
+
     key = str(payload.get("key", "manual"))
-    candidate_id = payload.get("candidateId") or hashlib.sha256(
-        f"{job_id}|{key}|{candidate.get('email','')}|{candidate.get('name','')}".encode()
-    ).hexdigest()[:20]
-    item = {"candidateId": candidate_id, "jobId": job_id,
-            "name": candidate.get("name", ""), "email": candidate.get("email", ""),
-            "phone": candidate.get("phone", ""), "cvKey": key,
-            "skills": candidate.get("skills", []),
-            "requiredSkills": required, **scores,
-            "scoredAt": datetime.now(timezone.utc).isoformat()}
-    # DynamoDB không nhận float trực tiếp: chuyển mọi số sang Decimal.
-    db_item = json.loads(json.dumps(item, ensure_ascii=False), parse_float=Decimal)
+
+    candidate_id = payload.get("candidateId")
+
+    if not candidate_id:
+        candidate_id = hashlib.sha256(
+            (
+                f"{job_id}|{key}|"
+                f"{candidate.get('email', '')}|"
+                f"{candidate.get('name', '')}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+
+    item = {
+        "candidateId": candidate_id,
+        "jobId": job_id,
+        "name": candidate.get("name", ""),
+        "email": candidate.get("email", ""),
+        "phone": candidate.get("phone", ""),
+        "cvKey": key,
+        "skills": candidate.get("skills", []),
+        "requiredSkills": required,
+        **scores,
+        "scoredAt": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    # DynamoDB yeu cau Decimal thay cho float
+    db_item = json.loads(
+        json.dumps(item, ensure_ascii=False),
+        parse_float=Decimal
+    )
+
     table.put_item(Item=db_item)
-    print(json.dumps({"candidateId": candidate_id, "jobId": job_id,
-                      "extractionStatus": scores["extractionStatus"], "saved": True}))
+
+    print(json.dumps({
+        "candidateId": candidate_id,
+        "jobId": job_id,
+        "extractionStatus": scores[
+            "extractionStatus"
+        ],
+        "saved": True
+    }))
+
     return to_json(item)
+
+
+# ==========================================
+# XEP HANG UNG VIEN THEO JOB
+# ==========================================
+
+def get_job_ranking(job_id):
+    job_id = str(job_id or "").strip()
+
+    if not job_id:
+        raise ValueError("jobId is required")
+
+    items = []
+    scan_args = {}
+
+    # Doc het cac trang cua DynamoDB
+    while True:
+        response = table.scan(**scan_args)
+
+        for item in response.get("Items", []):
+            if (
+                item.get("jobId") == job_id
+                and item.get("totalScore") is not None
+            ):
+                items.append(item)
+
+        last_key = response.get(
+            "LastEvaluatedKey"
+        )
+
+        if not last_key:
+            break
+
+        scan_args["ExclusiveStartKey"] = last_key
+
+    # Xep diem giam dan
+    items.sort(
+        key=lambda item: (
+            -float(item["totalScore"]),
+            str(item.get("candidateId", ""))
+        )
+    )
+
+    ranked = []
+
+    for index, item in enumerate(items, 1):
+        ranked.append({
+            "rank": index,
+            "candidateId": item.get(
+                "candidateId"
+            ),
+            "name": item.get("name", ""),
+            "matchedSkills": item.get(
+                "matchedSkills", []
+            ),
+            "missingSkills": item.get(
+                "missingSkills", []
+            ),
+            "experienceYears": item.get(
+                "experienceYears"
+            ),
+            "skillScore": item.get(
+                "skillScore", 0
+            ),
+            "experienceScore": item.get(
+                "experienceScore", 0
+            ),
+            "totalScore": item.get(
+                "totalScore", 0
+            ),
+            "extractionStatus": item.get(
+                "extractionStatus", "UNKNOWN"
+            )
+        })
+
+    return {
+        "jobId": job_id,
+        "count": len(ranked),
+        "items": ranked
+    }
 
 
 def lambda_handler(event, context):
@@ -90,10 +239,35 @@ def lambda_handler(event, context):
         http = event.get("requestContext", {}).get("http", {})
         method = http.get("method", event.get("httpMethod", ""))
         path = event.get("rawPath", event.get("path", ""))
+     
         if method == "GET" and path.endswith("/candidates"):
-            # Demo: scan tối đa 100 bản ghi; production nên dùng phân trang.
-            items = table.scan(Limit=100).get("Items", [])
-            return reply(200, {"count": len(items), "items": items})
+
+            params = event.get(
+                "pathParameters"
+            ) or {}
+
+            job_id = params.get("jobId")
+
+            if not job_id:
+                parts = path.strip("/").split("/")
+
+                if (
+                    len(parts) >= 3
+                    and parts[-3] == "jobs"
+                ):
+                    job_id = parts[-2]
+
+            if not job_id:
+                query = event.get(
+                    "queryStringParameters"
+                ) or {}
+
+                job_id = query.get("jobId")
+
+            return reply(
+                200,
+                get_job_ranking(job_id)
+            )
         if method == "POST" and path.endswith("/candidates"):
             payload = json.loads(event.get("body") or "{}")
             return reply(200, process(payload))
