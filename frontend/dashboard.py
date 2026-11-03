@@ -495,7 +495,11 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         except Exception as error:
-            print("Dashboard error:", type(error).__name__)
+            print(
+                "Dashboard error:",
+                type(error).__name__,
+                 str(error)
+            )
             return self.respond(
                 502,
                 {
